@@ -753,6 +753,80 @@ async function main(): Promise<void> {
 
   console.log("\n└────────────────────────────────────────┘");
 
+  // SOL cost summary
+  console.log("\n┌─── SOL COST SUMMARY ───────────────────┐\n");
+
+  // Parse compute budget instructions for priority fee
+  let computeUnitLimit: number | null = null;
+  let computeUnitPrice: bigint | null = null; // microlamports per CU
+  const COMPUTE_BUDGET = "ComputeBudget111111111111111111111111111111";
+
+  for (const ix of compiledIxs) {
+    const programId = resolvedKeys[ix.programIdIndex] ?? "";
+    if (programId === COMPUTE_BUDGET && ix.data.length >= 1) {
+      const discriminator = ix.data[0];
+      // SetComputeUnitLimit = 2, data: [2, u32 LE]
+      if (discriminator === 2 && ix.data.length >= 5) {
+        computeUnitLimit = ix.data[1] | (ix.data[2] << 8) | (ix.data[3] << 16) | (ix.data[4] << 24);
+      }
+      // SetComputeUnitPrice = 3, data: [3, u64 LE] (microlamports per CU)
+      if (discriminator === 3 && ix.data.length >= 9) {
+        computeUnitPrice = readU64(ix.data, 1);
+      }
+    }
+  }
+
+  const numSignatures = message.header.numRequiredSignatures;
+  const baseFee = BigInt(numSignatures) * 5000n; // 5000 lamports per signature
+
+  // Priority fee = (computeUnitPrice * unitsConsumed) / 1_000_000
+  const unitsConsumed = BigInt(simResult.unitsConsumed ?? 0);
+  let priorityFee = 0n;
+  if (computeUnitPrice !== null) {
+    priorityFee = (computeUnitPrice * unitsConsumed) / 1_000_000n;
+  }
+
+  // SOL spent on account creation / transfers
+  const solSpentTypes = ["SOL Transfer", "CreateAccount"];
+  const solSpent = allActivity
+    .filter((a) => solSpentTypes.includes(a.type))
+    .reduce((sum, a) => sum + BigInt(a.amount ?? "0"), 0n);
+
+  // SOL reclaimed from account closures
+  // (CloseAccount sends rent back, but we'd need the lamport amount from the account — not available from parsed ix)
+
+  const totalCost = baseFee + priorityFee + solSpent;
+
+  const fmtSol = (lamports: bigint): string => {
+    const sol = Number(lamports) / 1e9;
+    return `${sol.toFixed(9)} SOL (${lamports} lamports)`;
+  };
+
+  console.log(`  Base fee (${numSignatures} sig${numSignatures > 1 ? "s" : ""}):  ${fmtSol(baseFee)}`);
+
+  if (computeUnitPrice !== null) {
+    console.log(`  Priority fee:          ${fmtSol(priorityFee)}`);
+    console.log(`    (${computeUnitPrice} microlamports/CU x ${unitsConsumed} CU)`);
+  }
+  if (computeUnitLimit !== null) {
+    console.log(`  Compute unit limit:    ${computeUnitLimit.toLocaleString()}`);
+  }
+  console.log(`  Compute units used:    ${unitsConsumed.toLocaleString()}`);
+
+  if (solSpent > 0n) {
+    console.log(`  Account funding:       ${fmtSol(solSpent)}`);
+    // Itemize
+    for (const a of allActivity.filter((a) => solSpentTypes.includes(a.type))) {
+      const label = a.type === "CreateAccount" ? `create ${shortenAddr(a.account!)}` : `transfer -> ${shortenAddr(a.destination!)}`;
+      console.log(`    ${label}: ${fmtSol(BigInt(a.amount!))}`);
+    }
+  }
+
+  console.log(`  ────────────────────────`);
+  console.log(`  TOTAL SOL COST:        ${fmtSol(totalCost)}`);
+
+  console.log("\n└────────────────────────────────────────┘");
+
   // Instruction flow summary
   console.log("\n┌─── INSTRUCTION FLOW ───────────────────┐\n");
   let depth = 0;
