@@ -47,17 +47,29 @@ interface TokenActivity {
   destination?: string;
   amount?: string;
   mint?: string;
+  owner?: string;
+  account?: string;
   decimals?: number;
   programId: string;
 }
 
+interface ParsedInnerIx {
+  program: string;
+  programId: string;
+  stackHeight: number;
+  parsed?: {
+    type: string;
+    info: Record<string, unknown>;
+  };
+  // Fallback for unparsed instructions
+  accounts?: number[];
+  data?: string;
+  programIdIndex?: number;
+}
+
 interface InnerInstruction {
   index: number;
-  instructions: Array<{
-    programIdIndex: number;
-    accounts: number[];
-    data: string;
-  }>;
+  instructions: ParsedInnerIx[];
 }
 
 function parseInspectorUrl(url: string): string {
@@ -143,6 +155,32 @@ function bs58Decode(str: string): Uint8Array {
   }
 
   return new Uint8Array(bytes.reverse());
+}
+
+function bs58Encode(bytes: Uint8Array): string {
+  const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const digits: number[] = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let result = "";
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    result += "1";
+  }
+  for (let i = digits.length - 1; i >= 0; i--) {
+    result += ALPHABET[digits[i]];
+  }
+  return result;
 }
 
 function decodeTokenInstruction(
@@ -240,7 +278,61 @@ function decodeTokenInstruction(
     };
   }
 
-  // For non-transfer token instructions, still report them
+  // InitializeAccount: [1], accounts: [account, mint, owner, rent]
+  if (ixType === 1 && accountIndexes.length >= 3) {
+    return {
+      type: "InitializeAccount",
+      account: resolve(accountIndexes[0]),
+      mint: resolve(accountIndexes[1]),
+      owner: resolve(accountIndexes[2]),
+      programId,
+    };
+  }
+
+  // InitializeAccount2: [16] + Pubkey owner, accounts: [account, mint]
+  if (ixType === 16 && accountIndexes.length >= 2) {
+    let owner: string | undefined;
+    if (bytes.length >= 33) {
+      const ownerBytes = bytes.slice(1, 33);
+      owner = bs58Encode(ownerBytes);
+    }
+    return {
+      type: "InitializeAccount2",
+      account: resolve(accountIndexes[0]),
+      mint: resolve(accountIndexes[1]),
+      owner,
+      programId,
+    };
+  }
+
+  // InitializeAccount3: [18] + Pubkey owner, accounts: [account, mint]
+  if (ixType === 18 && accountIndexes.length >= 2) {
+    let owner: string | undefined;
+    if (bytes.length >= 33) {
+      const ownerBytes = bytes.slice(1, 33);
+      owner = bs58Encode(ownerBytes);
+    }
+    return {
+      type: "InitializeAccount3",
+      account: resolve(accountIndexes[0]),
+      mint: resolve(accountIndexes[1]),
+      owner,
+      programId,
+    };
+  }
+
+  // CloseAccount: [9], accounts: [account, dest, owner]
+  if (ixType === 9 && accountIndexes.length >= 3) {
+    return {
+      type: "CloseAccount",
+      account: resolve(accountIndexes[0]),
+      destination: resolve(accountIndexes[1]),
+      owner: resolve(accountIndexes[2]),
+      programId,
+    };
+  }
+
+  // For other token instructions, still report them
   return {
     type: ixName,
     programId,
@@ -469,35 +561,109 @@ async function main(): Promise<void> {
     }
   }
 
-  // Inner instructions from simulation
+  // Inner instructions from simulation (parsed format)
   const innerIxs = simResult.innerInstructions ?? [];
   for (const group of innerIxs) {
     for (const ix of group.instructions) {
-      const programId = resolvedKeys[ix.programIdIndex] ?? `idx(${ix.programIdIndex})`;
-      if (programId === TOKEN_PROGRAM || programId === TOKEN_2022_PROGRAM) {
-        const activity = decodeTokenInstruction(
-          ix.data,
-          ix.accounts,
-          resolvedKeys,
-          programId,
-        );
-        if (activity) allActivity.push(activity);
+      if (!ix.parsed) continue;
+      const { type, info } = ix.parsed;
+
+      // SPL Token instructions
+      if (ix.program === "spl-token" || ix.programId === TOKEN_PROGRAM || ix.programId === TOKEN_2022_PROGRAM) {
+        if (type === "transfer") {
+          allActivity.push({
+            type: "Transfer",
+            source: info.source as string,
+            destination: info.destination as string,
+            amount: String(info.amount),
+            programId: ix.programId,
+          });
+        } else if (type === "transferChecked") {
+          const tokenAmount = info.tokenAmount as { amount: string; decimals: number } | undefined;
+          allActivity.push({
+            type: "TransferChecked",
+            source: info.source as string,
+            destination: info.destination as string,
+            mint: info.mint as string,
+            amount: tokenAmount?.amount ?? String(info.amount),
+            decimals: tokenAmount?.decimals ?? (info.decimals as number | undefined),
+            programId: ix.programId,
+          });
+        } else if (type === "mintTo") {
+          allActivity.push({
+            type: "MintTo",
+            mint: info.mint as string,
+            destination: info.account as string,
+            amount: String(info.amount),
+            programId: ix.programId,
+          });
+        } else if (type === "mintToChecked") {
+          const tokenAmount = info.tokenAmount as { amount: string; decimals: number } | undefined;
+          allActivity.push({
+            type: "MintToChecked",
+            mint: info.mint as string,
+            destination: info.account as string,
+            amount: tokenAmount?.amount ?? String(info.amount),
+            decimals: tokenAmount?.decimals ?? (info.decimals as number | undefined),
+            programId: ix.programId,
+          });
+        } else if (type === "burn") {
+          allActivity.push({
+            type: "Burn",
+            source: info.account as string,
+            mint: info.mint as string,
+            amount: String(info.amount),
+            programId: ix.programId,
+          });
+        } else if (type === "burnChecked") {
+          const tokenAmount = info.tokenAmount as { amount: string; decimals: number } | undefined;
+          allActivity.push({
+            type: "BurnChecked",
+            source: info.account as string,
+            mint: info.mint as string,
+            amount: tokenAmount?.amount ?? String(info.amount),
+            decimals: tokenAmount?.decimals ?? (info.decimals as number | undefined),
+            programId: ix.programId,
+          });
+        } else if (type === "initializeAccount" || type === "initializeAccount2" || type === "initializeAccount3") {
+          allActivity.push({
+            type: type.charAt(0).toUpperCase() + type.slice(1),
+            account: info.account as string,
+            mint: info.mint as string,
+            owner: info.owner as string | undefined,
+            programId: ix.programId,
+          });
+        } else if (type === "closeAccount") {
+          allActivity.push({
+            type: "CloseAccount",
+            account: info.account as string,
+            destination: info.destination as string,
+            owner: info.owner as string | undefined,
+            programId: ix.programId,
+          });
+        } else {
+          allActivity.push({ type, programId: ix.programId });
+        }
       }
 
-      // System program transfers
-      if (programId === SYSTEM_PROGRAM) {
-        const bytes = bs58Decode(ix.data);
-        // SystemProgram.Transfer = discriminator 2 (u32 LE) + u64 lamports
-        if (bytes.length >= 12 && bytes[0] === 2 && bytes[1] === 0 && bytes[2] === 0 && bytes[3] === 0) {
-          const lamports = readU64(bytes, 4);
-          const source = ix.accounts.length > 0 ? resolvedKeys[ix.accounts[0]] : "unknown";
-          const dest = ix.accounts.length > 1 ? resolvedKeys[ix.accounts[1]] : "unknown";
+      // System program
+      if (ix.program === "system" || ix.programId === SYSTEM_PROGRAM) {
+        if (type === "transfer") {
           allActivity.push({
             type: "SOL Transfer",
-            source,
-            destination: dest,
-            amount: lamports.toString(),
-            programId,
+            source: info.source as string,
+            destination: info.destination as string,
+            amount: String(info.lamports),
+            programId: ix.programId,
+          });
+        } else if (type === "createAccount") {
+          allActivity.push({
+            type: "CreateAccount",
+            source: info.source as string,
+            account: info.newAccount as string,
+            owner: info.owner as string | undefined,
+            amount: String(info.lamports),
+            programId: ix.programId,
           });
         }
       }
@@ -505,16 +671,13 @@ async function main(): Promise<void> {
   }
 
   if (allActivity.length === 0) {
-    console.log("  No token/SOL transfers in this transaction.");
-    console.log("  (Token Program invocations were for account setup only)");
+    console.log("  No token/SOL activity in this transaction.");
   } else {
     // Separate transfers from non-transfer activity
-    const transfers = allActivity.filter((a) =>
-      ["Transfer", "TransferChecked", "MintTo", "MintToChecked", "Burn", "BurnChecked", "SOL Transfer"].includes(a.type),
-    );
-    const other = allActivity.filter((a) =>
-      !["Transfer", "TransferChecked", "MintTo", "MintToChecked", "Burn", "BurnChecked", "SOL Transfer"].includes(a.type),
-    );
+    const TRANSFER_TYPES = ["Transfer", "TransferChecked", "MintTo", "MintToChecked", "Burn", "BurnChecked", "SOL Transfer"];
+    const ACCOUNT_TYPES = ["InitializeAccount", "InitializeAccount2", "InitializeAccount3", "CloseAccount", "CreateAccount"];
+    const transfers = allActivity.filter((a) => TRANSFER_TYPES.includes(a.type));
+    const other = allActivity.filter((a) => !TRANSFER_TYPES.includes(a.type) && !ACCOUNT_TYPES.includes(a.type));
 
     if (transfers.length > 0) {
       console.log("  Transfers:");
@@ -547,9 +710,39 @@ async function main(): Promise<void> {
       }
     }
 
+    const accountOps = allActivity.filter((a) => ACCOUNT_TYPES.includes(a.type));
+
+    if (accountOps.length > 0) {
+      console.log(
+        transfers.length > 0 ? "\n  Account Operations:" : "  Account Operations:",
+      );
+      for (const a of accountOps) {
+        const prog = a.programId === TOKEN_2022_PROGRAM ? " (Token-2022)" : "";
+        if (a.type.startsWith("InitializeAccount")) {
+          console.log(`    INIT  account: ${a.account}${prog}`);
+          console.log(`          mint:    ${a.mint}`);
+          if (a.owner) {
+            console.log(`          owner:   ${a.owner}`);
+          }
+        } else if (a.type === "CloseAccount") {
+          console.log(`    CLOSE account: ${a.account}${prog}`);
+          console.log(`          rent -> ${a.destination}`);
+          if (a.owner) {
+            console.log(`          owner:   ${a.owner}`);
+          }
+        } else if (a.type === "CreateAccount") {
+          const sol = Number(BigInt(a.amount!) * 1000n / 1000000000n) / 1000;
+          console.log(`    CREATE account: ${a.account}`);
+          console.log(`           owner:   ${a.owner}`);
+          console.log(`           funded:  ${sol} SOL (${a.amount} lamports)`);
+          console.log(`           payer:   ${a.source}`);
+        }
+      }
+    }
+
     if (other.length > 0) {
       console.log(
-        transfers.length > 0 ? "\n  Other Token Activity:" : "  Token Activity:",
+        (transfers.length > 0 || accountOps.length > 0) ? "\n  Other Token Activity:" : "  Token Activity:",
       );
       for (const a of other) {
         const prog = a.programId === TOKEN_2022_PROGRAM ? " (Token-2022)" : "";
@@ -624,6 +817,58 @@ function decodeTokenInstructionFromBytes(
       destination: resolve(accountIndexes[2]),
       amount: amount.toString(),
       decimals,
+      programId,
+    };
+  }
+
+  // InitializeAccount: [1], accounts: [account, mint, owner, rent]
+  if (ixType === 1 && accountIndexes.length >= 3) {
+    return {
+      type: "InitializeAccount",
+      account: resolve(accountIndexes[0]),
+      mint: resolve(accountIndexes[1]),
+      owner: resolve(accountIndexes[2]),
+      programId,
+    };
+  }
+
+  // InitializeAccount2: [16] + Pubkey owner, accounts: [account, mint]
+  if (ixType === 16 && accountIndexes.length >= 2) {
+    let owner: string | undefined;
+    if (data.length >= 33) {
+      owner = bs58Encode(data.slice(1, 33));
+    }
+    return {
+      type: "InitializeAccount2",
+      account: resolve(accountIndexes[0]),
+      mint: resolve(accountIndexes[1]),
+      owner,
+      programId,
+    };
+  }
+
+  // InitializeAccount3: [18] + Pubkey owner, accounts: [account, mint]
+  if (ixType === 18 && accountIndexes.length >= 2) {
+    let owner: string | undefined;
+    if (data.length >= 33) {
+      owner = bs58Encode(data.slice(1, 33));
+    }
+    return {
+      type: "InitializeAccount3",
+      account: resolve(accountIndexes[0]),
+      mint: resolve(accountIndexes[1]),
+      owner,
+      programId,
+    };
+  }
+
+  // CloseAccount: [9], accounts: [account, dest, owner]
+  if (ixType === 9 && accountIndexes.length >= 3) {
+    return {
+      type: "CloseAccount",
+      account: resolve(accountIndexes[0]),
+      destination: resolve(accountIndexes[1]),
+      owner: resolve(accountIndexes[2]),
       programId,
     };
   }
