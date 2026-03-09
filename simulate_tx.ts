@@ -373,6 +373,9 @@ async function main(): Promise<void> {
   const serialized = Buffer.from(tx.serialize());
   const b64Tx = serialized.toString("base64");
 
+  // Collect all account addresses for balance tracking
+  const allAccountAddresses = [...resolvedKeys];
+
   const rpcResponse = await fetch(RPC_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -387,10 +390,36 @@ async function main(): Promise<void> {
           replaceRecentBlockhash: true,
           encoding: "base64",
           innerInstructions: true,
+          accounts: {
+            encoding: "jsonParsed",
+            addresses: allAccountAddresses,
+          },
         },
       ],
     }),
   });
+
+  interface TokenBalanceEntry {
+    accountIndex: number;
+    mint: string;
+    owner?: string;
+    programId?: string;
+    uiTokenAmount: {
+      amount: string;
+      decimals: number;
+      uiAmount: number | null;
+      uiAmountString: string;
+    };
+  }
+
+  interface AccountInfo {
+    lamports: number;
+    owner: string;
+    data: unknown;
+    executable: boolean;
+    rentEpoch: number;
+    space: number;
+  }
 
   const rpcData = (await rpcResponse.json()) as {
     result: {
@@ -399,6 +428,11 @@ async function main(): Promise<void> {
         logs: string[];
         unitsConsumed: number;
         innerInstructions?: InnerInstruction[];
+        preBalances: number[];
+        postBalances: number[];
+        preTokenBalances: TokenBalanceEntry[];
+        postTokenBalances: TokenBalanceEntry[];
+        accounts: (AccountInfo | null)[];
       };
     };
   };
@@ -416,6 +450,117 @@ async function main(): Promise<void> {
   console.log(
     `\nCompute units consumed: ${simResult.unitsConsumed ?? "N/A"}`,
   );
+
+  // SOL Balance Changes
+  const preBalances = simResult.preBalances ?? [];
+  const postBalances = simResult.postBalances ?? [];
+
+  if (preBalances.length > 0 && postBalances.length > 0) {
+    console.log("\n┌─── SOL BALANCE CHANGES ─────────────────┐\n");
+
+    const solChanges: Array<{
+      address: string;
+      index: number;
+      pre: number;
+      post: number;
+      diff: number;
+    }> = [];
+
+    for (let i = 0; i < Math.min(preBalances.length, postBalances.length); i++) {
+      const diff = postBalances[i] - preBalances[i];
+      if (diff !== 0) {
+        solChanges.push({
+          address: allAccountAddresses[i] ?? `account_${i}`,
+          index: i,
+          pre: preBalances[i],
+          post: postBalances[i],
+          diff,
+        });
+      }
+    }
+
+    if (solChanges.length === 0) {
+      console.log("  No SOL balance changes.");
+    } else {
+      for (const change of solChanges) {
+        const sign = change.diff > 0 ? "+" : "";
+        const diffSol = change.diff / 1e9;
+        const preSol = change.pre / 1e9;
+        const postSol = change.post / 1e9;
+        console.log(
+          `  ${shortenAddr(change.address)} (account ${change.index})`,
+        );
+        console.log(
+          `    ${preSol.toFixed(9)} -> ${postSol.toFixed(9)} SOL  (${sign}${diffSol.toFixed(9)} SOL / ${sign}${change.diff} lamports)`,
+        );
+      }
+    }
+
+    console.log("\n└────────────────────────────────────────┘");
+  }
+
+  // Token Balance Changes
+  const preTokenBalances = simResult.preTokenBalances ?? [];
+  const postTokenBalances = simResult.postTokenBalances ?? [];
+
+  if (preTokenBalances.length > 0 || postTokenBalances.length > 0) {
+    console.log("\n┌─── TOKEN BALANCE CHANGES ───────────────┐\n");
+
+    // Build a map keyed by accountIndex+mint for diffing
+    const preMap = new Map<string, TokenBalanceEntry>();
+    for (const entry of preTokenBalances) {
+      preMap.set(`${entry.accountIndex}:${entry.mint}`, entry);
+    }
+    const postMap = new Map<string, TokenBalanceEntry>();
+    for (const entry of postTokenBalances) {
+      postMap.set(`${entry.accountIndex}:${entry.mint}`, entry);
+    }
+
+    const allTokenKeys = new Set([...preMap.keys(), ...postMap.keys()]);
+
+    let hasChanges = false;
+    for (const key of allTokenKeys) {
+      const pre = preMap.get(key);
+      const post = postMap.get(key);
+
+      const preAmount = BigInt(pre?.uiTokenAmount.amount ?? "0");
+      const postAmount = BigInt(post?.uiTokenAmount.amount ?? "0");
+      const diff = postAmount - preAmount;
+
+      if (diff === 0n) continue;
+      hasChanges = true;
+
+      const entry = post ?? pre!;
+      const decimals = entry.uiTokenAmount.decimals;
+      const mint = entry.mint;
+      const owner = entry.owner ?? "unknown";
+      const accountAddr = allAccountAddresses[entry.accountIndex] ?? `account_${entry.accountIndex}`;
+
+      const sign = diff > 0n ? "+" : "";
+      const diffFormatted = formatAmount(
+        (diff < 0n ? -diff : diff).toString(),
+        decimals,
+      );
+      const preFormatted = formatAmount(preAmount.toString(), decimals);
+      const postFormatted = formatAmount(postAmount.toString(), decimals);
+
+      console.log(
+        `  ${shortenAddr(accountAddr)} (owner: ${shortenAddr(owner)})`,
+      );
+      console.log(
+        `    Mint: ${mint}`,
+      );
+      console.log(
+        `    ${preFormatted} -> ${postFormatted}  (${sign}${diffFormatted})`,
+      );
+    }
+
+    if (!hasChanges) {
+      console.log("  No token balance changes.");
+    }
+
+    console.log("\n└────────────────────────────────────────┘");
+  }
 
   // Logs
   const logs = simResult.logs ?? [];
